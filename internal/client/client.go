@@ -1,0 +1,182 @@
+// Package client implements an HTTP client for the Tenable Security Center
+// analysis REST API.
+package client
+
+import (
+	"bytes"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// Filter represents a single query filter sent to the analysis API.
+type Filter struct {
+	FilterName string `json:"filterName"`
+	Operator   string `json:"operator"`
+	Value      string `json:"value"`
+}
+
+// Column selects a field to include in the API response.
+type Column struct {
+	Name string `json:"name"`
+}
+
+// analysisRequest is the JSON body for POST /rest/analysis.
+type analysisRequest struct {
+	Type        string   `json:"type"`
+	SourceType  string   `json:"sourceType"`
+	Query       query    `json:"query"`
+	SortField   string   `json:"sortField,omitempty"`
+	SortDir     string   `json:"sortDir,omitempty"`
+	Columns     []Column `json:"columns,omitempty"`
+	StartOffset int      `json:"startOffset"`
+	EndOffset   int      `json:"endOffset"`
+}
+
+type query struct {
+	Type    string   `json:"type"`
+	Tool    string   `json:"tool"`
+	Filters []Filter `json:"filters"`
+}
+
+// analysisResponse mirrors the SC API response envelope.
+type analysisResponse struct {
+	Type     string `json:"type"`
+	ErrorMsg string `json:"error_msg,omitempty"`
+	Response struct {
+		TotalRecords    string            `json:"totalRecords"`
+		ReturnedRecords int               `json:"returnedRecords"`
+		StartOffset     int               `json:"startOffset"`
+		EndOffset       int               `json:"endOffset"`
+		Results         []json.RawMessage `json:"results"`
+	} `json:"response"`
+}
+
+// Client wraps an HTTP client pre-configured for a single Security Center.
+type Client struct {
+	baseURL   string
+	accessKey string
+	secretKey string
+	pageSize  int
+	httpC     *http.Client
+	log       *slog.Logger
+}
+
+// New creates a Client for one Security Center instance.
+func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *slog.Logger) *Client {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLS}, //nolint:gosec
+		MaxIdleConns:    10,
+		IdleConnTimeout: 90 * time.Second,
+	}
+	return &Client{
+		baseURL:   strings.TrimRight(baseURL, "/"),
+		accessKey: accessKey,
+		secretKey: secretKey,
+		pageSize:  pageSize,
+		httpC: &http.Client{
+			Timeout:   120 * time.Second,
+			Transport: transport,
+		},
+		log: log,
+	}
+}
+
+// FetchAll pages through POST /rest/analysis and returns every matching record
+// as a raw JSON object. It handles pagination automatically.
+func (c *Client) FetchAll(filters []Filter, columns []Column) ([]json.RawMessage, error) {
+	var all []json.RawMessage
+
+	for start := 0; ; start += c.pageSize {
+		req := analysisRequest{
+			Type:       "vuln",
+			SourceType: "cumulative",
+			Query: query{
+				Type:    "vuln",
+				Tool:    "vulndetails",
+				Filters: filters,
+			},
+			SortField:   "severity",
+			SortDir:     "desc",
+			Columns:     columns,
+			StartOffset: start,
+			EndOffset:   start + c.pageSize,
+		}
+
+		resp, err := c.post(req)
+		if err != nil {
+			return nil, err
+		}
+
+		all = append(all, resp.Response.Results...)
+
+		c.log.Debug("page fetched",
+			"startOffset", start,
+			"returned", resp.Response.ReturnedRecords,
+			"total", resp.Response.TotalRecords,
+		)
+
+		// Last page: fewer results than requested means we have everything.
+		if resp.Response.ReturnedRecords < c.pageSize {
+			break
+		}
+	}
+
+	return all, nil
+}
+
+// post marshals req, sends it to /rest/analysis, and returns the parsed response.
+func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/rest/analysis", bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("building HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	// Tenable SC API key authentication header (SC 5.13+).
+	req.Header.Set("X-ApiKey", fmt.Sprintf("accessKey=%s; secretKey=%s", c.accessKey, c.secretKey))
+
+	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.StartOffset)
+
+	httpResp, err := c.httpC.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing HTTP request: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	raw, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SC returned HTTP %d: %s", httpResp.StatusCode, clip(string(raw), 300))
+	}
+
+	var resp analysisResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("parsing response JSON: %w", err)
+	}
+	if resp.ErrorMsg != "" {
+		return nil, fmt.Errorf("SC API error: %s", resp.ErrorMsg)
+	}
+
+	return &resp, nil
+}
+
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}

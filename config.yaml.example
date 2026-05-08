@@ -1,0 +1,23 @@
+# sc-vuln configuration file.
+# Copy to config.yaml and fill in your credentials.
+
+# List every Tenable Security Center instance to query.
+# All configured SCs are queried concurrently unless --sc restricts the list.
+security_centers:
+  - name: primary
+    url: https://sc1.example.com
+    access_key: REPLACE_WITH_ACCESS_KEY
+    secret_key: REPLACE_WITH_SECRET_KEY
+    # skip_tls: true   # uncomment only in lab/dev environments
+
+  - name: secondary
+    url: https://sc2.example.com
+    access_key: REPLACE_WITH_ACCESS_KEY
+    secret_key: REPLACE_WITH_SECRET_KEY
+
+# Log verbosity: debug | info | warn | error  (default: info)
+# Can be overridden at runtime with --log-level.
+log_level: info
+
+# Number of records fetched per API page (default: 1000, max depends on SC).
+page_size: 1000
