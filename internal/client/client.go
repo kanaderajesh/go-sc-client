@@ -15,6 +15,11 @@ import (
 	"time"
 )
 
+const (
+	maxRetries  = 3
+	retryDelay  = 2 * time.Second // doubles after each attempt: 2s, 4s, 8s
+)
+
 // Filter represents a single query filter sent to the analysis API.
 type Filter struct {
 	FilterName string `json:"filterName"`
@@ -72,12 +77,18 @@ type Client struct {
 }
 
 // New creates a Client for one Security Center instance.
-// dumpW is where request JSON bodies are written before each call; nil disables dumping.
-func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *slog.Logger, dumpW io.Writer) *Client {
+// timeout is the per-request deadline (covers the full round-trip including
+// reading the response body). dumpW is where request JSON bodies are written
+// before each call; pass nil to disable.
+func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, timeout time.Duration, log *slog.Logger, dumpW io.Writer) *Client {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLS}, //nolint:gosec
 		MaxIdleConns:    10,
 		IdleConnTimeout: 90 * time.Second,
+		// ResponseHeaderTimeout guards against servers that accept the connection
+		// but stall before sending the first response byte (the "waiting for headers"
+		// variant of context deadline exceeded).
+		ResponseHeaderTimeout: timeout,
 	}
 	return &Client{
 		baseURL:   strings.TrimRight(baseURL, "/"),
@@ -85,7 +96,7 @@ func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *
 		secretKey: secretKey,
 		pageSize:  pageSize,
 		httpC: &http.Client{
-			Timeout:   120 * time.Second,
+			Timeout:   timeout,
 			Transport: transport,
 		},
 		log:   log,
@@ -138,7 +149,9 @@ func (c *Client) FetchAll(filters []Filter, columns []string) ([]json.RawMessage
 	return all, nil
 }
 
-// post marshals req, dumps it, sends it to /rest/analysis, and returns the parsed response.
+// post marshals req, dumps it, and sends it to /rest/analysis with automatic
+// retry on transient failures (network errors, timeouts, HTTP 5xx).
+// Retries use exponential backoff: 2 s → 4 s → 8 s.
 func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 	// Pretty-print and dump request JSON to console + log file before sending.
 	if c.dumpW != nil {
@@ -157,30 +170,68 @@ func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 		return nil, fmt.Errorf("marshalling request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/rest/analysis", bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("building HTTP request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	// Tenable SC API key authentication header (SC 5.13+).
-	req.Header.Set("X-ApiKey", fmt.Sprintf("accessKey=%s; secretKey=%s", c.accessKey, c.secretKey))
-
 	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.Query.StartOffset, "endOffset", body.Query.EndOffset)
 
-	httpResp, err := c.httpC.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing HTTP request: %w", err)
-	}
-	defer httpResp.Body.Close()
+	var (
+		raw     []byte
+		status  int
+		lastErr error
+	)
 
-	raw, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
+	backoff := retryDelay
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			c.log.Warn("retrying request after failure",
+				"attempt", attempt,
+				"maxRetries", maxRetries,
+				"backoff", backoff.String(),
+				"error", lastErr,
+			)
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+
+		// Rebuild the request each attempt: the body reader is consumed after
+		// the first read, and http.Request must not be reused after a send.
+		req, err := http.NewRequest(http.MethodPost, c.baseURL+"/rest/analysis", bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("building HTTP request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("X-ApiKey", fmt.Sprintf("accessKey=%s; secretKey=%s", c.accessKey, c.secretKey))
+
+		httpResp, err := c.httpC.Do(req)
+		if err != nil {
+			// Network-level error (includes context deadline exceeded / timeout).
+			lastErr = fmt.Errorf("HTTP request failed: %w", err)
+			continue
+		}
+
+		raw, err = io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("reading response body: %w", err)
+			continue
+		}
+
+		status = httpResp.StatusCode
+		if status >= 500 {
+			// Server-side error — worth retrying.
+			lastErr = fmt.Errorf("SC returned HTTP %d: %s", status, clip(string(raw), 300))
+			continue
+		}
+
+		// Any non-5xx response (including 4xx) is not retried.
+		lastErr = nil
+		break
 	}
 
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("SC returned HTTP %d: %s", httpResp.StatusCode, clip(string(raw), 300))
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("SC returned HTTP %d: %s", status, clip(string(raw), 300))
 	}
 
 	var resp analysisResponse

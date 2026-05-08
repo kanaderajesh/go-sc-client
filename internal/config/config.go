@@ -44,6 +44,9 @@ type Config struct {
 	LogFile string `yaml:"log_file"`
 	// PageSize is the number of records fetched per API page (default 1000).
 	PageSize int `yaml:"page_size"`
+	// Timeout is the HTTP request timeout in seconds (default 300).
+	// Increase this when querying large repositories or slow SC instances.
+	Timeout int `yaml:"timeout"`
 }
 
 // Load reads and validates the YAML config file at path.
@@ -61,6 +64,9 @@ func Load(path string) (*Config, error) {
 	// Apply defaults.
 	if cfg.PageSize <= 0 {
 		cfg.PageSize = 1000
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 300
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
