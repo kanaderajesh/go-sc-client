@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,8 +35,8 @@ type analysisRequest struct {
 	SortField   string   `json:"sortField,omitempty"`
 	SortDir     string   `json:"sortDir,omitempty"`
 	Columns     []Column `json:"columns,omitempty"`
-	StartOffset int      `json:"startOffset"`
-	EndOffset   int      `json:"endOffset"`
+	StartOffset string   `json:"startOffset"`
+	EndOffset   string   `json:"endOffset"`
 }
 
 type query struct {
@@ -51,8 +52,8 @@ type analysisResponse struct {
 	Response struct {
 		TotalRecords    string            `json:"totalRecords"`
 		ReturnedRecords int               `json:"returnedRecords"`
-		StartOffset     int               `json:"startOffset"`
-		EndOffset       int               `json:"endOffset"`
+		StartOffset     string            `json:"startOffset"`
+		EndOffset       string            `json:"endOffset"`
 		Results         []json.RawMessage `json:"results"`
 	} `json:"response"`
 }
@@ -110,8 +111,8 @@ func (c *Client) FetchAll(filters []Filter, columns []Column) ([]json.RawMessage
 			SortField:   "severity",
 			SortDir:     "desc",
 			Columns:     columns,
-			StartOffset: start,
-			EndOffset:   start + c.pageSize,
+			StartOffset: strconv.Itoa(start),
+			EndOffset:   strconv.Itoa(start + c.pageSize),
 		}
 
 		resp, err := c.post(req)
@@ -142,7 +143,7 @@ func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 	if c.dumpW != nil {
 		pretty, _ := json.MarshalIndent(body, "", "  ")
 		fmt.Fprintf(c.dumpW,
-			"\n=== Request: POST %s/rest/analysis (offset %d) ===\n%s\n%s\n\n",
+			"\n=== Request: POST %s/rest/analysis (offset %s) ===\n%s\n%s\n\n",
 			c.baseURL,
 			body.StartOffset,
 			pretty,
@@ -164,7 +165,7 @@ func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 	// Tenable SC API key authentication header (SC 5.13+).
 	req.Header.Set("X-ApiKey", fmt.Sprintf("accessKey=%s; secretKey=%s", c.accessKey, c.secretKey))
 
-	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.StartOffset)
+	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.StartOffset, "endOffset", body.EndOffset)
 
 	httpResp, err := c.httpC.Do(req)
 	if err != nil {
