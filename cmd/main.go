@@ -46,19 +46,25 @@ func newRootCmd() *cobra.Command {
 		format           string
 		logLevel         string
 		logFile          string
-		scNames          string
 		timeout          int
 		fullSearchOutput string
 	)
 
 	cmd := &cobra.Command{
-		Use:   "sc-vuln",
+		Use:   "sc-vuln [sc-name[,sc-name...]]",
 		Short: "Fetch vulnerability data from Tenable Security Center",
 		Long: `sc-vuln queries the Tenable Security Center /rest/analysis API for
 vulnerability data. Each severity level runs in its own goroutine so that
 requests to the same (or multiple) Security Centers are processed concurrently.
 
 Authentication uses Tenable SC API keys (access_key + secret_key).
+
+The optional positional argument selects which Security Center(s) to query.
+Omit it to query all configured SCs concurrently.
+
+  sc-vuln                     # all configured SCs
+  sc-vuln primary             # one SC by name
+  sc-vuln primary,dr-site     # multiple SCs by name
 
 Filter precedence (append mode):
   severity → config default_filters → config per-SC filters → --plugin-text → --filter
@@ -82,6 +88,7 @@ Example config (config.yaml):
   log_file: /var/log/sc-vuln.log
   page_size: 1000
 `,
+		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Build a temporary logger for pre-config errors.
@@ -127,9 +134,9 @@ Example config (config.yaml):
 				dumpW = io.MultiWriter(os.Stderr, fileW)
 			}
 
-			// Optionally restrict which SCs are queried.
-			if scNames != "" {
-				cfg, err = filterSCs(cfg, scNames)
+			// Optional positional argument selects which SCs to query.
+			if len(args) > 0 && args[0] != "" {
+				cfg, err = filterSCs(cfg, args[0])
 				if err != nil {
 					return err
 				}
@@ -243,8 +250,6 @@ Example config (config.yaml):
 		"log verbosity: debug | info | warn | error\n  (overrides config file log_level)")
 	f.StringVar(&logFile, "log-file", "",
 		"path to a JSON log file (appended); request JSON is also written here\n  (overrides config file log_file)")
-	f.StringVar(&scNames, "sc", "",
-		"comma-separated SC names to query (default: all configured)")
 	f.IntVar(&timeout, "timeout", 0,
 		"HTTP request timeout in seconds (0 = use config file timeout, default 300)\n  increase when SC is slow or repositories are large")
 	f.StringVar(&fullSearchOutput, "full-search-keyword", "",
