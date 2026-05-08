@@ -67,6 +67,13 @@ log_level: info
 
 # Records fetched per API page (default: 1000).
 page_size: 1000
+
+# Keywords for --full-search-keyword mode (case-insensitive substring match
+# against each record's pluginText field). One CSV file per severity is produced.
+# search_keywords:
+#   - apache
+#   - log4j
+#   - openssl
 ```
 
 Multiple Security Centers are queried in parallel — there is no limit on the
@@ -104,22 +111,35 @@ stdout once all goroutines have finished.
 ## Command-line reference
 
 ```
-sc-vuln [flags]
+sc-vuln [sc-name[,sc-name...]] [flags]
+
+Arguments:
+  sc-name   Optional comma-separated list of Security Center names to query.
+            Names must match the name field in config.yaml.
+            Omit to query all configured SCs concurrently.
+
+              sc-vuln                   # all configured SCs
+              sc-vuln primary           # one SC by name
+              sc-vuln primary,dr-site   # two SCs by name
 
 Flags:
-  -c, --config string        Path to the YAML config file (default "config.yaml")
-  -p, --plugin-text string   Filter by plugin text — substring match against plugin output
-  -s, --severity string      Comma-separated severity levels (default "4,3,2,1,0")
-                               0=Info  1=Low  2=Medium  3=High  4=Critical
-  -f, --filter stringArray   Extra API filter as name=value (repeatable)
-  -m, --filter-mode string   How --filter interacts with built-in filters (default "append")
-                               append   add --filter values alongside severity/pluginText
-                               override replace everything except severity with --filter values
-      --columns string       Comma-separated SC field names to return
-      --sc string            Comma-separated SC names to query (default: all configured)
-  -o, --format string        Output format: table | json | csv (default "table")
-  -l, --log-level string     Log verbosity: debug | info | warn | error
-  -h, --help                 Show this help
+  -c, --config string              Path to the YAML config file (default "config.yaml")
+  -p, --plugin-text string         Filter by plugin text — substring match against plugin output
+  -s, --severity string            Comma-separated severity levels (default "4,3,2,1,0")
+                                     0=Info  1=Low  2=Medium  3=High  4=Critical
+  -f, --filter stringArray         Extra API filter as name=value (repeatable)
+  -m, --filter-mode string         How --filter interacts with built-in filters (default "append")
+                                     append   add --filter values alongside severity/pluginText
+                                     override replace everything except severity with --filter values
+      --columns string             Comma-separated SC field names to return
+      --full-search-keyword string Enable full client-side keyword search.
+                                   Value is the CSV output file prefix.
+                                   One file per severity: <prefix>_Critical.csv, etc.
+                                   Keywords come from config search_keywords list.
+  -o, --format string              Output format: table | json | csv (default "table")
+  -l, --log-level string           Log verbosity: debug | info | warn | error
+      --timeout int                HTTP request timeout in seconds (0 = use config, default 300)
+  -h, --help                       Show this help
 ```
 
 ### Default output columns
@@ -233,22 +253,87 @@ fully control what is queried:
   > critical_high_apache.csv
 ```
 
-### Query a single Security Center when multiple are configured
+### Query a specific Security Center when multiple are configured
+
+Pass the SC name as a positional argument. Use a comma-separated list for
+multiple SCs. Omit the argument entirely to query all configured SCs.
 
 ```bash
-./sc-vuln --sc primary --severity 4
+# One SC only
+./sc-vuln primary --severity 4
+
+# Two SCs, Critical + High
+./sc-vuln primary,dr-site --severity 4,3
+
+# All configured SCs (no argument)
+./sc-vuln --severity 4
 ```
 
 ### Debug mode to inspect API requests and pagination
 
 ```bash
-./sc-vuln --severity 4 --log-level debug
+./sc-vuln primary --severity 4 --log-level debug
 ```
+
+### Full client-side keyword search
+
+The `--full-search-keyword` flag enables client-side search mode. Every
+vulnerability record's `pluginText` field is checked against the keywords
+listed under `search_keywords` in `config.yaml` (case-insensitive substring
+match). Matching records are written to per-severity CSV files.
+
+**1. Add keywords to `config.yaml`:**
+
+```yaml
+search_keywords:
+  - apache
+  - log4j
+  - openssl
+  - spring
+```
+
+**2. Run the search:**
+
+```bash
+# Search all severities — produces Critical.csv, High.csv, Medium.csv, Low.csv, Info.csv
+./sc-vuln --full-search-keyword /tmp/vuln_results
+
+# Search only Critical and High on a specific SC
+./sc-vuln primary --severity 4,3 --full-search-keyword /tmp/vuln_results
+
+# Custom columns in the output CSV
+./sc-vuln --severity 4,3 \
+  --columns ip,dnsName,pluginID,name,cvssV3BaseScore,solution \
+  --full-search-keyword ./scan_$(date +%Y%m%d)
+```
+
+**Output files** (one per severity, named with the severity label):
+
+```
+/tmp/vuln_results_Critical.csv
+/tmp/vuln_results_High.csv
+/tmp/vuln_results_Medium.csv
+/tmp/vuln_results_Low.csv
+/tmp/vuln_results_Info.csv
+```
+
+**CSV columns:** the columns you selected + `_matched_keyword` + `_severity` + `_sc`.
+
+**Console progress** (written to stderr, one line per page per SC/severity):
+
+```
+[primary/Critical] Page 1 | 1000/8542 records (11.7%) | keywords: apache, log4j
+[primary/Critical] Page 2 | 2000/8542 records (23.4%) | keywords: apache, log4j
+[dr-site/High]     Page 1 | 500/2301 records (21.7%)  | keywords: apache, log4j
+```
+
+> **Note:** CSV files are always flushed and closed even if an error occurs
+> mid-search, so partial results are never lost.
 
 ### Full example combining multiple options
 
 ```bash
-./sc-vuln \
+./sc-vuln primary \
   --config /etc/sc-vuln/config.yaml \
   --severity 4,3 \
   --plugin-text "ssl" \
@@ -314,6 +399,6 @@ RFC 4180 CSV with a header row matching the `--columns` selection.
 | `HTTP 403` | Invalid or expired API keys | Regenerate keys in SC → Users → API Keys |
 | `HTTP 401` | Wrong `X-ApiKey` header format | Verify `access_key` / `secret_key` in config |
 | `certificate signed by unknown authority` | Self-signed SC certificate | Add `skip_tls: true` to the SC entry in config |
-| `context deadline exceeded` | SC unreachable or slow | Check network connectivity; increase timeout via `page_size` reduction |
+| `context deadline exceeded` | SC unreachable or slow | Check network connectivity; use `--timeout 600` to increase the limit |
 | Empty results | Filter too restrictive | Run with `--log-level debug` to see the exact filters sent |
 | `no security_centers defined` | Config file missing or wrong path | Use `-c /path/to/config.yaml` to specify the path |
