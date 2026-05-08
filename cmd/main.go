@@ -19,6 +19,7 @@ import (
 	"github.com/kanaderajesh/go-sc-client/internal/client"
 	"github.com/kanaderajesh/go-sc-client/internal/config"
 	"github.com/kanaderajesh/go-sc-client/internal/output"
+	"github.com/kanaderajesh/go-sc-client/internal/search"
 	"github.com/kanaderajesh/go-sc-client/internal/vuln"
 )
 
@@ -36,17 +37,18 @@ func main() {
 
 func newRootCmd() *cobra.Command {
 	var (
-		cfgFile     string
-		pluginText  string
-		severities  string
-		filterMode  string
-		extraFilter []string
-		columns     string
-		format      string
-		logLevel    string
-		logFile     string
-		scNames     string
-		timeout     int
+		cfgFile          string
+		pluginText       string
+		severities       string
+		filterMode       string
+		extraFilter      []string
+		columns          string
+		format           string
+		logLevel         string
+		logFile          string
+		scNames          string
+		timeout          int
+		fullSearchOutput string
 	)
 
 	cmd := &cobra.Command{
@@ -152,6 +154,37 @@ Example config (config.yaml):
 				cols = cfg.DefaultColumns
 			}
 
+			// ── Full keyword search mode ────────────────────────────────────────
+			if fullSearchOutput != "" {
+				keywords := cfg.SearchKeywords
+				if len(keywords) == 0 {
+					return fmt.Errorf("--full-search-keyword requires search_keywords defined in config file")
+				}
+				searchOpts := &search.Options{
+					Severities:   sevList,
+					ExtraFilters: extra,
+					FilterMode:   filterMode,
+					Keywords:     keywords,
+					Columns:      cols,
+					OutputPrefix: fullSearchOutput,
+					DumpWriter:   dumpW,
+				}
+				log.Info("starting full keyword search",
+					"security_centers", len(cfg.SecurityCenters),
+					"severities", severityLabels(sevList),
+					"keywords", keywords,
+					"outputPrefix", fullSearchOutput,
+				)
+				if err := search.Run(cfg, searchOpts, log); err != nil {
+					log.Error("full keyword search failed", "error", err)
+					return err
+				}
+				log.Info("full keyword search complete",
+					"files", fmt.Sprintf("%s_<Severity>.csv", fullSearchOutput))
+				return nil
+			}
+			// ── Normal vulnerability fetch mode ─────────────────────────────────
+
 			opts := &vuln.Options{
 				Severities:   sevList,
 				PluginText:   pluginText,
@@ -214,6 +247,8 @@ Example config (config.yaml):
 		"comma-separated SC names to query (default: all configured)")
 	f.IntVar(&timeout, "timeout", 0,
 		"HTTP request timeout in seconds (0 = use config file timeout, default 300)\n  increase when SC is slow or repositories are large")
+	f.StringVar(&fullSearchOutput, "full-search-keyword", "",
+		"enable full client-side keyword search; value is the output file prefix\n  one CSV is written per severity: <prefix>_Critical.csv, <prefix>_High.csv, ...\n  keywords are read from config file search_keywords list")
 
 	return cmd
 }

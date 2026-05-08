@@ -76,3 +76,16 @@ timeout: 300
 
 # Number of records fetched per API page (default: 1000, max depends on SC).
 page_size: 1000
+
+# Full client-side keyword search (activated with --full-search-keyword <prefix>).
+# Each keyword is matched case-insensitively against the pluginText field of every
+# vulnerability record fetched from SC.  Matching records are written to per-severity
+# CSV files: <prefix>_Critical.csv, <prefix>_High.csv, <prefix>_Medium.csv, etc.
+# Each severity level runs in its own goroutine and writes to its own file.
+# CSV files are always flushed/closed even when an error occurs (partial results preserved).
+#
+# search_keywords:
+#   - apache
+#   - log4j
+#   - openssl
+#   - spring

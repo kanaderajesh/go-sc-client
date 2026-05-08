@@ -72,15 +72,15 @@ func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 		scLog := log.With("sc", sc.Name, "url", sc.URL)
 
 		// Merge global default_filters + this SC's filters into one ordered slice.
-		scConfigFilters := configToClientFilters(cfg.DefaultFilters)
-		scConfigFilters = append(scConfigFilters, configToClientFilters(sc.Filters)...)
+		scConfigFilters := ConfigToClientFilters(cfg.DefaultFilters)
+		scConfigFilters = append(scConfigFilters, ConfigToClientFilters(sc.Filters)...)
 
 		for _, sev := range opts.Severities {
 			wg.Add(1)
 			go func(slot int, scName string, cl *client.Client, l *slog.Logger, severity int, cfgFilters []client.Filter) {
 				defer wg.Done()
 
-				filters := buildFilters(opts, severity, cfgFilters)
+				filters := BuildFilters(opts, severity, cfgFilters)
 
 				l.Info("fetching vulnerabilities",
 					"severity", fmt.Sprintf("%d (%s)", severity, SeverityName[severity]),
@@ -118,7 +118,7 @@ func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 	return results
 }
 
-// buildFilters assembles the final filter list for one severity level.
+// BuildFilters assembles the final filter list for one severity level.
 //
 // append mode (default):
 //
@@ -127,7 +127,7 @@ func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 // override mode:
 //
 //	severity → ExtraFilters (CLI only; config and pluginText are skipped)
-func buildFilters(opts *Options, severity int, configFilters []client.Filter) []client.Filter {
+func BuildFilters(opts *Options, severity int, configFilters []client.Filter) []client.Filter {
 	sevFilter := client.Filter{FilterName: "severity", Operator: "=", Value: strconv.Itoa(severity)}
 
 	if opts.FilterMode == "override" {
@@ -175,8 +175,8 @@ func Flatten(results []Result) ([]map[string]any, []error) {
 	return rows, errs
 }
 
-// configToClientFilters converts config.FilterConfig slice to client.Filter slice.
-func configToClientFilters(cfgFilters []config.FilterConfig) []client.Filter {
+// ConfigToClientFilters converts config.FilterConfig slice to client.Filter slice.
+func ConfigToClientFilters(cfgFilters []config.FilterConfig) []client.Filter {
 	out := make([]client.Filter, len(cfgFilters))
 	for i, f := range cfgFilters {
 		op := f.Operator
