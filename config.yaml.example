@@ -66,5 +66,13 @@ log_level: info
 # Leave empty or omit to disable file logging.
 log_file: ""
 
+# HTTP request timeout in seconds (default: 300).
+# Covers the full round-trip including response body download.
+# Also controls ResponseHeaderTimeout (waiting for first byte from server).
+# Retries are attempted up to 3 times with exponential backoff (2s, 4s, 8s)
+# on network errors, timeouts, and HTTP 5xx responses.
+# Can be overridden at runtime with --timeout.
+timeout: 300
+
 # Number of records fetched per API page (default: 1000, max depends on SC).
 page_size: 1000

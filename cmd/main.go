@@ -46,6 +46,7 @@ func newRootCmd() *cobra.Command {
 		logLevel    string
 		logFile     string
 		scNames     string
+		timeout     int
 	)
 
 	cmd := &cobra.Command{
@@ -87,6 +88,11 @@ Example config (config.yaml):
 			cfg, err := config.Load(cfgFile)
 			if err != nil {
 				return fmt.Errorf("config: %w", err)
+			}
+
+			// CLI --timeout overrides config file timeout.
+			if timeout > 0 {
+				cfg.Timeout = timeout
 			}
 
 			// Resolve effective log level: CLI flag > config file > default.
@@ -206,6 +212,8 @@ Example config (config.yaml):
 		"path to a JSON log file (appended); request JSON is also written here\n  (overrides config file log_file)")
 	f.StringVar(&scNames, "sc", "",
 		"comma-separated SC names to query (default: all configured)")
+	f.IntVar(&timeout, "timeout", 0,
+		"HTTP request timeout in seconds (0 = use config file timeout, default 300)\n  increase when SC is slow or repositories are large")
 
 	return cmd
 }

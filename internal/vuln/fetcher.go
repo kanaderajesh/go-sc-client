@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/kanaderajesh/go-sc-client/internal/client"
 	"github.com/kanaderajesh/go-sc-client/internal/config"
@@ -66,7 +67,8 @@ func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 	idx := 0
 
 	for _, sc := range cfg.SecurityCenters {
-		c := client.New(sc.URL, sc.AccessKey, sc.SecretKey, sc.SkipTLS, cfg.PageSize, log, opts.DumpWriter)
+		timeout := time.Duration(cfg.Timeout) * time.Second
+		c := client.New(sc.URL, sc.AccessKey, sc.SecretKey, sc.SkipTLS, cfg.PageSize, timeout, log, opts.DumpWriter)
 		scLog := log.With("sc", sc.Name, "url", sc.URL)
 
 		// Merge global default_filters + this SC's filters into one ordered slice.
