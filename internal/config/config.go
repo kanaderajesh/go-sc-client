@@ -7,7 +7,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// SecurityCenter holds connection credentials for one Tenable SC instance.
+// FilterConfig defines a query filter that can be declared in the config file.
+// Operator defaults to "=" if omitted.
+type FilterConfig struct {
+	Name     string `yaml:"name"`
+	Operator string `yaml:"operator"`
+	Value    string `yaml:"value"`
+}
+
+// SecurityCenter holds connection credentials and optional per-instance filters.
 type SecurityCenter struct {
 	Name      string `yaml:"name"`
 	URL       string `yaml:"url"`
@@ -15,13 +23,21 @@ type SecurityCenter struct {
 	SecretKey string `yaml:"secret_key"`
 	// SkipTLS disables certificate verification (use only in lab environments).
 	SkipTLS bool `yaml:"skip_tls"`
+	// Filters are extra query filters applied only when querying this SC.
+	// They are merged with DefaultFilters and appended before CLI filters.
+	Filters []FilterConfig `yaml:"filters"`
 }
 
 // Config is the top-level configuration loaded from the YAML file.
 type Config struct {
 	SecurityCenters []SecurityCenter `yaml:"security_centers"`
+	// DefaultFilters are applied to every query, for every SC, before CLI filters.
+	// Ignored when --filter-mode override is used.
+	DefaultFilters []FilterConfig `yaml:"default_filters"`
 	// LogLevel controls verbosity: debug, info, warn, error.
 	LogLevel string `yaml:"log_level"`
+	// LogFile is the path for a structured JSON log file. Empty = file logging disabled.
+	LogFile string `yaml:"log_file"`
 	// PageSize is the number of records fetched per API page (default 1000).
 	PageSize int `yaml:"page_size"`
 }
@@ -44,6 +60,20 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
+	}
+
+	// Default operator for any filter that omits it.
+	for i := range cfg.DefaultFilters {
+		if cfg.DefaultFilters[i].Operator == "" {
+			cfg.DefaultFilters[i].Operator = "="
+		}
+	}
+	for si := range cfg.SecurityCenters {
+		for i := range cfg.SecurityCenters[si].Filters {
+			if cfg.SecurityCenters[si].Filters[i].Operator == "" {
+				cfg.SecurityCenters[si].Filters[i].Operator = "="
+			}
+		}
 	}
 
 	// Validate.

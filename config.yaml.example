@@ -10,14 +10,43 @@ security_centers:
     secret_key: REPLACE_WITH_SECRET_KEY
     # skip_tls: true   # uncomment only in lab/dev environments
 
+    # Per-SC filters: applied only when querying this SC.
+    # Merged after default_filters, before CLI --filter values.
+    # filters:
+    #   - name: repository
+    #     value: "1"
+    #   - name: ip
+    #     operator: "="
+    #     value: "10.0.0.0/8"
+
   - name: secondary
     url: https://sc2.example.com
     access_key: REPLACE_WITH_ACCESS_KEY
     secret_key: REPLACE_WITH_SECRET_KEY
+    # filters:
+    #   - name: repository
+    #     value: "2"
+
+# Global filters applied to EVERY query regardless of which SC is targeted.
+# These are inserted between the mandatory severity filter and CLI --filter values.
+# Ignored when --filter-mode override is used on the command line.
+#
+# default_filters:
+#   - name: pluginText
+#     value: apache
+#   - name: exploitAvailable
+#     operator: "="
+#     value: "true"
 
 # Log verbosity: debug | info | warn | error  (default: info)
 # Can be overridden at runtime with --log-level.
 log_level: info
+
+# Path to a JSON structured log file (created/appended automatically).
+# All slog messages AND request JSON bodies are written here.
+# Can be overridden at runtime with --log-file.
+# Leave empty or omit to disable file logging.
+log_file: ""
 
 # Number of records fetched per API page (default: 1000, max depends on SC).
 page_size: 1000

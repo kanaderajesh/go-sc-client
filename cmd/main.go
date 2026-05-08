@@ -6,7 +6,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
@@ -42,6 +44,7 @@ func newRootCmd() *cobra.Command {
 		columns     string
 		format      string
 		logLevel    string
+		logFile     string
 		scNames     string
 	)
 
@@ -54,6 +57,11 @@ requests to the same (or multiple) Security Centers are processed concurrently.
 
 Authentication uses Tenable SC API keys (access_key + secret_key).
 
+Filter precedence (append mode):
+  severity → config default_filters → config per-SC filters → --plugin-text → --filter
+
+With --filter-mode override only severity + --filter values are sent.
+
 Example config (config.yaml):
 
   security_centers:
@@ -61,33 +69,54 @@ Example config (config.yaml):
       url: https://sc.example.com
       access_key: AAAA...
       secret_key: BBBB...
+      filters:
+        - name: repository
+          value: "1"
+  default_filters:
+    - name: pluginText
+      value: apache
   log_level: info
+  log_file: /var/log/sc-vuln.log
   page_size: 1000
-
-Usage examples:
-
-  # Fetch critical and high vulns containing "apache" in plugin text
-  sc-vuln --plugin-text apache --severity 4,3
-
-  # Override all filters and return JSON
-  sc-vuln --filter ip=10.0.0.1 --filter-mode override --format json
-
-  # Custom columns, CSV output
-  sc-vuln --columns ip,pluginID,name,cvssV3BaseScore --format csv
 `,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Build logger early so we can log config errors.
-			log := newLogger(logLevel)
+			// Build a temporary logger for pre-config errors.
+			log := buildLogger(logLevel, slog.LevelInfo, os.Stderr, nil)
 
 			cfg, err := config.Load(cfgFile)
 			if err != nil {
 				return fmt.Errorf("config: %w", err)
 			}
 
-			// Config log level is a fallback when --log-level is not set.
-			if logLevel == "" {
-				log = newLogger(cfg.LogLevel)
+			// Resolve effective log level: CLI flag > config file > default.
+			effectiveLevel := resolveLevel(logLevel, cfg.LogLevel)
+
+			// Resolve effective log file path: CLI flag > config file.
+			effectiveLogFile := logFile
+			if effectiveLogFile == "" {
+				effectiveLogFile = cfg.LogFile
+			}
+
+			// Open log file (append) if one is configured.
+			var fileW io.Writer
+			if effectiveLogFile != "" {
+				f, err := os.OpenFile(effectiveLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+				if err != nil {
+					return fmt.Errorf("opening log file %q: %w", effectiveLogFile, err)
+				}
+				defer f.Close()
+				fileW = f
+			}
+
+			// Rebuild logger now that we have the full config.
+			// Console → text handler on stderr; file → JSON handler (machine-readable).
+			log = buildLogger(logLevel, effectiveLevel, os.Stderr, fileW)
+
+			// dumpW writes request JSON to stderr + log file before every HTTP call.
+			var dumpW io.Writer = os.Stderr
+			if fileW != nil {
+				dumpW = io.MultiWriter(os.Stderr, fileW)
 			}
 
 			// Optionally restrict which SCs are queried.
@@ -116,6 +145,7 @@ Usage examples:
 				ExtraFilters: extra,
 				FilterMode:   filterMode,
 				Columns:      cols,
+				DumpWriter:   dumpW,
 			}
 
 			log.Info("starting",
@@ -124,6 +154,7 @@ Usage examples:
 				"pluginText", pluginText,
 				"filterMode", filterMode,
 				"format", format,
+				"logFile", effectiveLogFile,
 			)
 
 			results := vuln.FetchAll(cfg, opts, log)
@@ -149,11 +180,11 @@ Usage examples:
 	f.StringVarP(&cfgFile, "config", "c", "config.yaml",
 		"path to the YAML config file")
 	f.StringVarP(&pluginText, "plugin-text", "p", "",
-		"filter by plugin text (substring match against plugin output)")
+		"filter by plugin text (substring match against plugin output)\n  overrides default_filters.pluginText from config")
 	f.StringVarP(&severities, "severity", "s", "4,3,2,1,0",
 		"comma-separated severity levels to query\n  0=Info  1=Low  2=Medium  3=High  4=Critical")
 	f.StringVarP(&filterMode, "filter-mode", "m", "append",
-		"how --filter values interact with built-in filters:\n  append   add to severity/pluginText defaults\n  override replace all defaults (severity is always kept)")
+		"how filters are composed:\n  append   severity → config filters → pluginText → --filter\n  override severity → --filter only (config filters skipped)")
 	f.StringArrayVarP(&extraFilter, "filter", "f", nil,
 		"extra API filter as name=value (repeatable)\n  e.g. -f ip=10.0.0.1 -f repository=42")
 	f.StringVar(&columns, "columns", "",
@@ -162,11 +193,15 @@ Usage examples:
 		"output format: table | json | csv")
 	f.StringVarP(&logLevel, "log-level", "l", "",
 		"log verbosity: debug | info | warn | error\n  (overrides config file log_level)")
+	f.StringVar(&logFile, "log-file", "",
+		"path to a JSON log file (appended); request JSON is also written here\n  (overrides config file log_file)")
 	f.StringVar(&scNames, "sc", "",
 		"comma-separated SC names to query (default: all configured)")
 
 	return cmd
 }
+
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 // parseSeverities converts "4,3,2" → []int{4,3,2}, deduplicating and
 // validating that each value is in the range [0,4].
@@ -193,8 +228,7 @@ func parseSeverities(s string) ([]int, error) {
 	return out, nil
 }
 
-// parseColumns splits a comma-separated column list, returning nil when empty
-// (so callers can fall back to defaultColumns).
+// parseColumns splits a comma-separated column list, returning nil when empty.
 func parseColumns(s string) []string {
 	if s == "" {
 		return nil
@@ -256,18 +290,78 @@ func severityLabels(sevs []int) string {
 	return strings.Join(parts, ",")
 }
 
-// newLogger creates a structured text logger writing to stderr.
-func newLogger(level string) *slog.Logger {
-	var lvl slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn", "warning":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
+// resolveLevel picks the effective slog.Level from CLI flag and config string.
+func resolveLevel(cliFlag, cfgLevel string) slog.Level {
+	src := cliFlag
+	if src == "" {
+		src = cfgLevel
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	switch strings.ToLower(src) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// buildLogger creates a logger that writes text to stderr and, when fileW is
+// non-nil, JSON records to fileW as well (both at effectiveLevel).
+func buildLogger(cliFlag string, effectiveLevel slog.Level, stderr io.Writer, fileW io.Writer) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: effectiveLevel}
+	textH := slog.NewTextHandler(stderr, opts)
+
+	if fileW == nil {
+		return slog.New(textH)
+	}
+	// JSON to file gives machine-readable, grep-friendly log records.
+	jsonH := slog.NewJSONHandler(fileW, opts)
+	return slog.New(&multiHandler{handlers: []slog.Handler{textH, jsonH}})
+}
+
+// ── multiHandler ─────────────────────────────────────────────────────────────
+
+// multiHandler fans out every slog record to multiple handlers simultaneously,
+// enabling concurrent console (text) and file (JSON) logging with a single logger.
+type multiHandler struct {
+	handlers []slog.Handler
+}
+
+func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, level) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, r.Level) {
+			if err := h.Handle(ctx, r.Clone()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	hs := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		hs[i] = h.WithAttrs(attrs)
+	}
+	return &multiHandler{handlers: hs}
+}
+
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	hs := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		hs[i] = h.WithGroup(name)
+	}
+	return &multiHandler{handlers: hs}
 }
