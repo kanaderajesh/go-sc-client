@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/kanaderajesh/go-sc-client/internal/client"
@@ -55,7 +56,8 @@ type Result struct {
 // Config filters are merged per SC: global default_filters first, then the
 // per-SC filters block, then CLI filters (behaviour depends on FilterMode).
 func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
-	columns := toColumns(opts.Columns)
+	// Join the column list into the comma-separated string the API expects.
+	columns := strings.Join(opts.Columns, ",")
 
 	// Pre-allocate result slice indexed by goroutine slot — no mutex needed.
 	total := len(cfg.SecurityCenters) * len(opts.Severities)
@@ -185,11 +187,3 @@ func configToClientFilters(cfgFilters []config.FilterConfig) []client.Filter {
 	return out
 }
 
-// toColumns converts a slice of field name strings into Column structs.
-func toColumns(names []string) []client.Column {
-	cols := make([]client.Column, len(names))
-	for i, n := range names {
-		cols[i] = client.Column{Name: n}
-	}
-	return cols
-}

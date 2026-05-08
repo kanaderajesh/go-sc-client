@@ -38,6 +38,24 @@ security_centers:
 #     operator: "="
 #     value: "true"
 
+# Columns to request from SC and display in output.
+# Sent to the API as a comma-separated string: "ip,pluginID,severity,...".
+# Overridden at runtime by --columns.  When omitted, a built-in set is used.
+#
+# default_columns:
+#   - ip
+#   - dnsName
+#   - pluginID
+#   - severity
+#   - name
+#   - protocol
+#   - port
+#   - firstSeen
+#   - lastSeen
+#   - cvssV3BaseScore
+#   - vprScore
+#   - exploitAvailable
+
 # Log verbosity: debug | info | warn | error  (default: info)
 # Can be overridden at runtime with --log-level.
 log_level: info

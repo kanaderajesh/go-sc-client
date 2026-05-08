@@ -34,6 +34,10 @@ type Config struct {
 	// DefaultFilters are applied to every query, for every SC, before CLI filters.
 	// Ignored when --filter-mode override is used.
 	DefaultFilters []FilterConfig `yaml:"default_filters"`
+	// DefaultColumns is the list of SC field names to request and display when
+	// --columns is not passed on the command line.  Each entry is a single field
+	// name (e.g. "ip", "pluginID").  Takes precedence over the built-in fallback.
+	DefaultColumns []string `yaml:"default_columns"`
 	// LogLevel controls verbosity: debug, info, warn, error.
 	LogLevel string `yaml:"log_level"`
 	// LogFile is the path for a structured JSON log file. Empty = file logging disabled.

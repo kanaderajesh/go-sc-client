@@ -22,21 +22,18 @@ type Filter struct {
 	Value      string `json:"value"`
 }
 
-// Column selects a field to include in the API response.
-type Column struct {
-	Name string `json:"name"`
-}
-
 // analysisRequest is the JSON body for POST /rest/analysis.
 type analysisRequest struct {
-	Type        string   `json:"type"`
-	SourceType  string   `json:"sourceType"`
-	Query       query    `json:"query"`
-	SortField   string   `json:"sortField,omitempty"`
-	SortDir     string   `json:"sortDir,omitempty"`
-	Columns     []Column `json:"columns,omitempty"`
-	StartOffset string   `json:"startOffset"`
-	EndOffset   string   `json:"endOffset"`
+	Type        string `json:"type"`
+	SourceType  string `json:"sourceType"`
+	Query       query  `json:"query"`
+	SortField   string `json:"sortField,omitempty"`
+	SortDir     string `json:"sortDir,omitempty"`
+	// Columns is a comma-separated list of field names, e.g. "ip,pluginID,severity".
+	// An empty string requests all available fields.
+	Columns     string `json:"columns,omitempty"`
+	StartOffset string `json:"startOffset"`
+	EndOffset   string `json:"endOffset"`
 }
 
 type query struct {
@@ -96,7 +93,9 @@ func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *
 
 // FetchAll pages through POST /rest/analysis and returns every matching record
 // as a raw JSON object. It handles pagination automatically.
-func (c *Client) FetchAll(filters []Filter, columns []Column) ([]json.RawMessage, error) {
+// columns is a comma-separated list of SC field names (e.g. "ip,pluginID,severity");
+// pass an empty string to request all available fields.
+func (c *Client) FetchAll(filters []Filter, columns string) ([]json.RawMessage, error) {
 	var all []json.RawMessage
 
 	for start := 0; ; start += c.pageSize {
