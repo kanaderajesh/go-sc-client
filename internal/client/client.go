@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,33 +22,26 @@ type Filter struct {
 	Value      string `json:"value"`
 }
 
-// Column represents one entry in the columns array of an analysis request.
-// The SC API expects each column as an object with a "name" field:
-//
-//	"columns": [ {"name": "ip"}, {"name": "pluginID"}, ... ]
-type Column struct {
-	Name string `json:"name"`
-}
-
 // analysisRequest is the JSON body for POST /rest/analysis.
-// Per the Tenable SC REST API documentation:
-//   - startOffset / endOffset are integer numbers at the root level
-//   - columns is an array of {"name": "<fieldName>"} objects at the root level
+// Per the Tenable SC REST API spec, startOffset/endOffset belong inside
+// the query object and columns is an array of field-name strings.
 type analysisRequest struct {
-	Type        string   `json:"type"`
-	SourceType  string   `json:"sourceType"`
-	Query       query    `json:"query"`
-	SortField   string   `json:"sortField,omitempty"`
-	SortDir     string   `json:"sortDir,omitempty"`
-	StartOffset int      `json:"startOffset"`
-	EndOffset   int      `json:"endOffset"`
-	Columns     []Column `json:"columns,omitempty"`
+	Type       string   `json:"type"`
+	SourceType string   `json:"sourceType"`
+	Query      query    `json:"query"`
+	SortField  string   `json:"sortField,omitempty"`
+	SortDir    string   `json:"sortDir,omitempty"`
+	// Columns is an array of SC field names to include in the response,
+	// e.g. ["ip","pluginID","severity"]. An empty slice returns all fields.
+	Columns []string `json:"columns,omitempty"`
 }
 
 type query struct {
-	Type    string   `json:"type"`
-	Tool    string   `json:"tool"`
-	Filters []Filter `json:"filters"`
+	Type        string   `json:"type"`
+	Tool        string   `json:"tool"`
+	Filters     []Filter `json:"filters"`
+	StartOffset string   `json:"startOffset"`
+	EndOffset   string   `json:"endOffset"`
 }
 
 // analysisResponse mirrors the SC API response envelope.
@@ -57,8 +51,8 @@ type analysisResponse struct {
 	Response struct {
 		TotalRecords    string            `json:"totalRecords"`
 		ReturnedRecords int               `json:"returnedRecords"`
-		StartOffset     int               `json:"startOffset"`
-		EndOffset       int               `json:"endOffset"`
+		StartOffset     string            `json:"startOffset"`
+		EndOffset       string            `json:"endOffset"`
 		Results         []json.RawMessage `json:"results"`
 	} `json:"response"`
 }
@@ -104,12 +98,6 @@ func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *
 // columns is the list of SC field names to return (e.g. ["ip","pluginID","severity"]);
 // pass nil or an empty slice to request all available fields.
 func (c *Client) FetchAll(filters []Filter, columns []string) ([]json.RawMessage, error) {
-	// Convert field-name strings to the [{"name":"..."}] format the API requires.
-	colObjs := make([]Column, len(columns))
-	for i, name := range columns {
-		colObjs[i] = Column{Name: name}
-	}
-
 	var all []json.RawMessage
 
 	for start := 0; ; start += c.pageSize {
@@ -117,15 +105,15 @@ func (c *Client) FetchAll(filters []Filter, columns []string) ([]json.RawMessage
 			Type:       "vuln",
 			SourceType: "cumulative",
 			Query: query{
-				Type:    "vuln",
-				Tool:    "vulndetails",
-				Filters: filters,
+				Type:        "vuln",
+				Tool:        "vulndetails",
+				Filters:     filters,
+				StartOffset: strconv.Itoa(start),
+				EndOffset:   strconv.Itoa(start + c.pageSize),
 			},
-			SortField:   "severity",
-			SortDir:     "desc",
-			StartOffset: start,
-			EndOffset:   start + c.pageSize,
-			Columns:     colObjs,
+			SortField: "severity",
+			SortDir:   "desc",
+			Columns:   columns,
 		}
 
 		resp, err := c.post(req)
@@ -156,9 +144,9 @@ func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 	if c.dumpW != nil {
 		pretty, _ := json.MarshalIndent(body, "", "  ")
 		fmt.Fprintf(c.dumpW,
-			"\n=== Request: POST %s/rest/analysis (offset %d) ===\n%s\n%s\n\n",
+			"\n=== Request: POST %s/rest/analysis (offset %s) ===\n%s\n%s\n\n",
 			c.baseURL,
-			body.StartOffset,
+			body.Query.StartOffset,
 			pretty,
 			strings.Repeat("=", 60),
 		)
@@ -178,7 +166,7 @@ func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 	// Tenable SC API key authentication header (SC 5.13+).
 	req.Header.Set("X-ApiKey", fmt.Sprintf("accessKey=%s; secretKey=%s", c.accessKey, c.secretKey))
 
-	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.StartOffset, "endOffset", body.EndOffset)
+	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.Query.StartOffset, "endOffset", body.Query.EndOffset)
 
 	httpResp, err := c.httpC.Do(req)
 	if err != nil {
