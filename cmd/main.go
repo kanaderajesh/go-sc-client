@@ -35,230 +35,420 @@ func main() {
 	}
 }
 
+// ── Command tree ─────────────────────────────────────────────────────────────
+
 func newRootCmd() *cobra.Command {
+	// Persistent flags are inherited by every subcommand.
 	var (
-		cfgFile          string
-		pluginText       string
-		severities       string
-		filterMode       string
-		extraFilter      []string
-		columns          string
-		format           string
-		logLevel         string
-		logFile          string
-		timeout          int
-		fullSearchOutput string
+		cfgFile     string
+		severities  string
+		filterMode  string
+		extraFilter []string
+		columns     string
+		logLevel    string
+		logFile     string
+		timeout     int
 	)
 
-	cmd := &cobra.Command{
+	// Root-only flags.
+	var format string
+
+	root := &cobra.Command{
 		Use:   "sc-vuln [sc-name[,sc-name...]]",
 		Short: "Fetch vulnerability data from Tenable Security Center",
 		Long: `sc-vuln queries the Tenable Security Center /rest/analysis API for
-vulnerability data. Each severity level runs in its own goroutine so that
-requests to the same (or multiple) Security Centers are processed concurrently.
-
-Authentication uses Tenable SC API keys (access_key + secret_key).
+vulnerability data. Each severity × SC combination runs in its own goroutine
+for maximum concurrency.
 
 The optional positional argument selects which Security Center(s) to query.
 Omit it to query all configured SCs concurrently.
 
-  sc-vuln                     # all configured SCs
-  sc-vuln primary             # one SC by name
-  sc-vuln primary,dr-site     # multiple SCs by name
+  sc-vuln                   # all configured SCs, all severities
+  sc-vuln primary           # one SC by name
+  sc-vuln primary,dr-site   # two SCs by name
 
-Filter precedence (append mode):
-  severity → config default_filters → config per-SC filters → --plugin-text → --filter
+Available subcommands:
+  plugin-text          Filter vulnerabilities by plugin output text keyword
+  full-search-keyword  Client-side keyword search with per-severity CSV output
 
-With --filter-mode override only severity + --filter values are sent.
-
-Example config (config.yaml):
-
-  security_centers:
-    - name: primary
-      url: https://sc.example.com
-      access_key: AAAA...
-      secret_key: BBBB...
-      filters:
-        - name: repository
-          value: "1"
-  default_filters:
-    - name: pluginText
-      value: apache
-  log_level: info
-  log_file: /var/log/sc-vuln.log
-  page_size: 1000
+Run 'sc-vuln <subcommand> --help' for subcommand-specific usage.
 `,
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Build a temporary logger for pre-config errors.
-			log := buildLogger(logLevel, slog.LevelInfo, os.Stderr, nil)
-
-			cfg, err := config.Load(cfgFile)
+			scName := ""
+			if len(args) > 0 {
+				scName = args[0]
+			}
+			cfg, log, fileW, cleanup, err := prepare(cfgFile, scName, logLevel, logFile, timeout)
 			if err != nil {
-				return fmt.Errorf("config: %w", err)
+				return err
 			}
+			defer cleanup()
 
-			// CLI --timeout overrides config file timeout.
-			if timeout > 0 {
-				cfg.Timeout = timeout
-			}
-
-			// Resolve effective log level: CLI flag > config file > default.
-			effectiveLevel := resolveLevel(logLevel, cfg.LogLevel)
-
-			// Resolve effective log file path: CLI flag > config file.
-			effectiveLogFile := logFile
-			if effectiveLogFile == "" {
-				effectiveLogFile = cfg.LogFile
-			}
-
-			// Open log file (append) if one is configured.
-			var fileW io.Writer
-			if effectiveLogFile != "" {
-				f, err := os.OpenFile(effectiveLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-				if err != nil {
-					return fmt.Errorf("opening log file %q: %w", effectiveLogFile, err)
-				}
-				defer f.Close()
-				fileW = f
-			}
-
-			// Rebuild logger now that we have the full config.
-			// Console → text handler on stderr; file → JSON handler (machine-readable).
-			log = buildLogger(logLevel, effectiveLevel, os.Stderr, fileW)
-
-			// dumpW writes request JSON to stderr + log file before every HTTP call.
-			var dumpW io.Writer = os.Stderr
-			if fileW != nil {
-				dumpW = io.MultiWriter(os.Stderr, fileW)
-			}
-
-			// Optional positional argument selects which SCs to query.
-			if len(args) > 0 && args[0] != "" {
-				cfg, err = filterSCs(cfg, args[0])
-				if err != nil {
-					return err
-				}
-			}
+			dumpW := makeDumpWriter(fileW)
 
 			sevList, err := parseSeverities(severities)
 			if err != nil {
 				return fmt.Errorf("--severity: %w", err)
 			}
-
 			extra, err := parseExtraFilters(extraFilter)
 			if err != nil {
 				return fmt.Errorf("--filter: %w", err)
 			}
-
-			// Column resolution (highest to lowest priority):
-			//   1. --columns CLI flag
-			//   2. default_columns from config file
-			//   3. built-in defaultColumns (hard-coded fallback)
-			cols := parseColumns(columns)
-			if len(cols) == 0 {
-				cols = cfg.DefaultColumns
-			}
-
-			// ── Full keyword search mode ────────────────────────────────────────
-			if fullSearchOutput != "" {
-				keywords := cfg.SearchKeywords
-				if len(keywords) == 0 {
-					return fmt.Errorf("--full-search-keyword requires search_keywords defined in config file")
-				}
-				searchOpts := &search.Options{
-					Severities:   sevList,
-					ExtraFilters: extra,
-					FilterMode:   filterMode,
-					Keywords:     keywords,
-					Columns:      cols,
-					OutputPrefix: fullSearchOutput,
-					DumpWriter:   dumpW,
-				}
-				log.Info("starting full keyword search",
-					"security_centers", len(cfg.SecurityCenters),
-					"severities", severityLabels(sevList),
-					"keywords", keywords,
-					"outputPrefix", fullSearchOutput,
-				)
-				if err := search.Run(cfg, searchOpts, log); err != nil {
-					log.Error("full keyword search failed", "error", err)
-					return err
-				}
-				log.Info("full keyword search complete",
-					"files", fmt.Sprintf("%s_<Severity>.csv", fullSearchOutput))
-				return nil
-			}
-			// ── Normal vulnerability fetch mode ─────────────────────────────────
-
-			opts := &vuln.Options{
-				Severities:   sevList,
-				PluginText:   pluginText,
-				ExtraFilters: extra,
-				FilterMode:   filterMode,
-				Columns:      cols,
-				DumpWriter:   dumpW,
-			}
+			cols := resolveColumns(columns, cfg.DefaultColumns)
 
 			log.Info("starting",
 				"security_centers", len(cfg.SecurityCenters),
 				"severities", severityLabels(sevList),
-				"pluginText", pluginText,
 				"filterMode", filterMode,
 				"format", format,
 				"columns", strings.Join(cols, ","),
-				"logFile", effectiveLogFile,
 			)
 
-			results := vuln.FetchAll(cfg, opts, log)
-			rows, errs := vuln.Flatten(results)
+			results := vuln.FetchAll(cfg, &vuln.Options{
+				Severities:   sevList,
+				ExtraFilters: extra,
+				FilterMode:   filterMode,
+				Columns:      cols,
+				DumpWriter:   dumpW,
+			}, log)
 
+			rows, errs := vuln.Flatten(results)
 			for _, e := range errs {
 				log.Error("partial failure", "error", e)
 			}
-
 			log.Info("done", "total_records", len(rows))
 
-			// Use resolved cols for display; fall back to built-in defaults only
-			// when neither CLI nor config supplied any columns.
 			displayCols := cols
 			if len(displayCols) == 0 {
 				displayCols = defaultColumns
 			}
-
 			return output.Format(os.Stdout, rows, displayCols, format)
 		},
 	}
 
-	f := cmd.Flags()
-	f.StringVarP(&cfgFile, "config", "c", "config.yaml",
+	// Register persistent flags (available to root and all subcommands).
+	pf := root.PersistentFlags()
+	pf.StringVarP(&cfgFile, "config", "c", "config.yaml",
 		"path to the YAML config file")
-	f.StringVarP(&pluginText, "plugin-text", "p", "",
-		"filter by plugin text (substring match against plugin output)\n  overrides default_filters.pluginText from config")
-	f.StringVarP(&severities, "severity", "s", "4,3,2,1,0",
+	pf.StringVarP(&severities, "severity", "s", "4,3,2,1,0",
 		"comma-separated severity levels to query\n  0=Info  1=Low  2=Medium  3=High  4=Critical")
-	f.StringVarP(&filterMode, "filter-mode", "m", "append",
-		"how filters are composed:\n  append   severity → config filters → pluginText → --filter\n  override severity → --filter only (config filters skipped)")
-	f.StringArrayVarP(&extraFilter, "filter", "f", nil,
+	pf.StringVarP(&filterMode, "filter-mode", "m", "append",
+		"how filters are composed:\n  append   severity → config filters → --filter\n  override severity → --filter only (config filters skipped)")
+	pf.StringArrayVarP(&extraFilter, "filter", "f", nil,
 		"extra API filter as name=value (repeatable)\n  e.g. -f ip=10.0.0.1 -f repository=42")
-	f.StringVar(&columns, "columns", "",
+	pf.StringVar(&columns, "columns", "",
 		"comma-separated SC field names to return\n  defaults: "+strings.Join(defaultColumns, ","))
-	f.StringVarP(&format, "format", "o", "table",
-		"output format: table | json | csv")
-	f.StringVarP(&logLevel, "log-level", "l", "",
+	pf.StringVarP(&logLevel, "log-level", "l", "",
 		"log verbosity: debug | info | warn | error\n  (overrides config file log_level)")
-	f.StringVar(&logFile, "log-file", "",
+	pf.StringVar(&logFile, "log-file", "",
 		"path to a JSON log file (appended); request JSON is also written here\n  (overrides config file log_file)")
-	f.IntVar(&timeout, "timeout", 0,
+	pf.IntVar(&timeout, "timeout", 0,
 		"HTTP request timeout in seconds (0 = use config file timeout, default 300)\n  increase when SC is slow or repositories are large")
-	f.StringVar(&fullSearchOutput, "full-search-keyword", "",
-		"enable full client-side keyword search; value is the output file prefix\n  one CSV is written per severity: <prefix>_Critical.csv, <prefix>_High.csv, ...\n  keywords are read from config file search_keywords list")
+
+	// Root-only flag.
+	root.Flags().StringVarP(&format, "format", "o", "table",
+		"output format: table | json | csv")
+
+	root.AddCommand(
+		newPluginTextCmd(&cfgFile, &severities, &filterMode, &extraFilter, &columns, &logLevel, &logFile, &timeout),
+		newFullSearchCmd(&cfgFile, &severities, &filterMode, &extraFilter, &columns, &logLevel, &logFile, &timeout),
+	)
+
+	return root
+}
+
+// newPluginTextCmd returns the plugin-text subcommand.
+//
+// Usage: sc-vuln plugin-text <keyword> [sc-name[,sc-name...]] [flags]
+func newPluginTextCmd(
+	cfgFile, severities, filterMode *string,
+	extraFilter *[]string,
+	columns, logLevel, logFile *string,
+	timeout *int,
+) *cobra.Command {
+	var format string
+
+	cmd := &cobra.Command{
+		Use:   "plugin-text <keyword> [sc-name[,sc-name...]]",
+		Short: "Filter vulnerabilities by plugin output text",
+		Long: `Fetch vulnerabilities whose plugin output contains <keyword>.
+
+The keyword is matched case-insensitively against each record's plugin output
+text and is sent to the SC API as a pluginText filter.
+
+Arguments:
+  keyword    Required. Substring to match against plugin output text.
+  sc-name    Optional. Comma-separated Security Center name(s) to query.
+             Omit to query all configured SCs concurrently.
+
+Flags:
+  -o, --format string   Output format: table | json | csv  (default "table")
+
+Inherited flags (see sc-vuln --help):
+  -c, --config        -s, --severity    -m, --filter-mode
+  -f, --filter        --columns         -l, --log-level
+  --log-file          --timeout
+
+Examples:
+  sc-vuln plugin-text apache
+  sc-vuln plugin-text apache primary
+  sc-vuln plugin-text "log4j" primary,dr-site --severity 4,3
+  sc-vuln plugin-text ssl --severity 4 --format csv > ssl_critical.csv
+  sc-vuln plugin-text openssl --columns ip,dnsName,pluginID,name,cvssV3BaseScore
+`,
+		Args:         cobra.RangeArgs(1, 2),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			keyword := args[0]
+			scName := ""
+			if len(args) == 2 {
+				scName = args[1]
+			}
+
+			cfg, log, fileW, cleanup, err := prepare(*cfgFile, scName, *logLevel, *logFile, *timeout)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			dumpW := makeDumpWriter(fileW)
+
+			sevList, err := parseSeverities(*severities)
+			if err != nil {
+				return fmt.Errorf("--severity: %w", err)
+			}
+			extra, err := parseExtraFilters(*extraFilter)
+			if err != nil {
+				return fmt.Errorf("--filter: %w", err)
+			}
+			cols := resolveColumns(*columns, cfg.DefaultColumns)
+
+			log.Info("starting plugin-text search",
+				"keyword", keyword,
+				"security_centers", len(cfg.SecurityCenters),
+				"severities", severityLabels(sevList),
+				"filterMode", *filterMode,
+				"format", format,
+				"columns", strings.Join(cols, ","),
+			)
+
+			results := vuln.FetchAll(cfg, &vuln.Options{
+				Severities:   sevList,
+				PluginText:   keyword,
+				ExtraFilters: extra,
+				FilterMode:   *filterMode,
+				Columns:      cols,
+				DumpWriter:   dumpW,
+			}, log)
+
+			rows, errs := vuln.Flatten(results)
+			for _, e := range errs {
+				log.Error("partial failure", "error", e)
+			}
+			log.Info("done", "total_records", len(rows))
+
+			displayCols := cols
+			if len(displayCols) == 0 {
+				displayCols = defaultColumns
+			}
+			return output.Format(os.Stdout, rows, displayCols, format)
+		},
+	}
+
+	cmd.Flags().StringVarP(&format, "format", "o", "table",
+		"output format: table | json | csv")
 
 	return cmd
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// newFullSearchCmd returns the full-search-keyword subcommand.
+//
+// Usage: sc-vuln full-search-keyword [sc-name[,sc-name...]] [flags]
+func newFullSearchCmd(
+	cfgFile, severities, filterMode *string,
+	extraFilter *[]string,
+	columns, logLevel, logFile *string,
+	timeout *int,
+) *cobra.Command {
+	var outputPrefix string
+
+	cmd := &cobra.Command{
+		Use:   "full-search-keyword [sc-name[,sc-name...]]",
+		Short: "Client-side keyword search with per-severity CSV output",
+		Long: `Fetch all vulnerabilities from SC and search each record's pluginText field
+against the keywords defined in config.yaml under search_keywords.
+
+Each keyword is matched case-insensitively. Matching records are written to
+per-severity CSV files. Each severity runs in its own goroutine and writes
+to its own output file. CSV files are always flushed and closed even when an
+error occurs, so partial results are never lost.
+
+Keywords must be configured in config.yaml:
+
+  search_keywords:
+    - apache
+    - log4j
+    - openssl
+
+Arguments:
+  sc-name    Optional. Comma-separated Security Center name(s) to query.
+             Omit to query all configured SCs concurrently.
+
+Flags:
+  -O, --output string   Base path for per-severity CSV output files (required).
+                        Produces: <output>_Critical.csv, <output>_High.csv,
+                                  <output>_Medium.csv, <output>_Low.csv,
+                                  <output>_Info.csv
+
+Inherited flags (see sc-vuln --help):
+  -c, --config        -s, --severity    -m, --filter-mode
+  -f, --filter        --columns         -l, --log-level
+  --log-file          --timeout
+
+CSV columns: <selected columns> + _matched_keyword + _severity + _sc
+
+Progress is printed to stderr after each page:
+  [primary/Critical] Page 1 | 1000/8542 records (11.7%) | keywords: apache, log4j
+
+Examples:
+  sc-vuln full-search-keyword --output /tmp/scan
+  sc-vuln full-search-keyword primary --output ./results
+  sc-vuln full-search-keyword primary,dr-site --severity 4,3 --output /tmp/scan
+  sc-vuln full-search-keyword --severity 4 --columns ip,dnsName,pluginID,name --output /tmp/crit
+`,
+		Args:         cobra.MaximumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if outputPrefix == "" {
+				return fmt.Errorf("--output is required; specify a base path for the CSV output files")
+			}
+
+			scName := ""
+			if len(args) > 0 {
+				scName = args[0]
+			}
+
+			cfg, log, fileW, cleanup, err := prepare(*cfgFile, scName, *logLevel, *logFile, *timeout)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			keywords := cfg.SearchKeywords
+			if len(keywords) == 0 {
+				return fmt.Errorf("full-search-keyword requires search_keywords to be defined in the config file")
+			}
+
+			dumpW := makeDumpWriter(fileW)
+
+			sevList, err := parseSeverities(*severities)
+			if err != nil {
+				return fmt.Errorf("--severity: %w", err)
+			}
+			extra, err := parseExtraFilters(*extraFilter)
+			if err != nil {
+				return fmt.Errorf("--filter: %w", err)
+			}
+			cols := resolveColumns(*columns, cfg.DefaultColumns)
+
+			log.Info("starting full keyword search",
+				"security_centers", len(cfg.SecurityCenters),
+				"severities", severityLabels(sevList),
+				"keywords", keywords,
+				"outputPrefix", outputPrefix,
+			)
+
+			if err := search.Run(cfg, &search.Options{
+				Severities:   sevList,
+				ExtraFilters: extra,
+				FilterMode:   *filterMode,
+				Keywords:     keywords,
+				Columns:      cols,
+				OutputPrefix: outputPrefix,
+				DumpWriter:   dumpW,
+			}, log); err != nil {
+				log.Error("full keyword search failed", "error", err)
+				return err
+			}
+
+			log.Info("full keyword search complete",
+				"files", fmt.Sprintf("%s_<Severity>.csv", outputPrefix))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&outputPrefix, "output", "O", "",
+		"base path for per-severity CSV output files (required)\n  produces <output>_Critical.csv, <output>_High.csv, ...")
+
+	return cmd
+}
+
+// ── Shared setup helper ───────────────────────────────────────────────────────
+
+// prepare loads config, resolves logging, opens the log file, and optionally
+// restricts which SCs are queried. The returned cleanup func closes the log
+// file; callers must defer it.
+func prepare(cfgFile, scName, logLevel, logFile string, timeout int) (
+	*config.Config, *slog.Logger, io.Writer, func(), error,
+) {
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		return nil, nil, nil, func() {}, fmt.Errorf("config: %w", err)
+	}
+	if timeout > 0 {
+		cfg.Timeout = timeout
+	}
+
+	effectiveLevel := resolveLevel(logLevel, cfg.LogLevel)
+	effectiveLogFile := logFile
+	if effectiveLogFile == "" {
+		effectiveLogFile = cfg.LogFile
+	}
+
+	var fileW io.Writer
+	cleanup := func() {}
+	if effectiveLogFile != "" {
+		f, err := os.OpenFile(effectiveLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, nil, nil, func() {}, fmt.Errorf("opening log file %q: %w", effectiveLogFile, err)
+		}
+		fileW = f
+		cleanup = func() { f.Close() }
+	}
+
+	log := buildLogger(logLevel, effectiveLevel, os.Stderr, fileW)
+
+	if scName != "" {
+		cfg, err = filterSCs(cfg, scName)
+		if err != nil {
+			cleanup()
+			return nil, nil, nil, func() {}, err
+		}
+	}
+
+	return cfg, log, fileW, cleanup, nil
+}
+
+// makeDumpWriter builds the writer used to dump request JSON before each HTTP
+// call. When a log file is open, output goes to both stderr and the file.
+func makeDumpWriter(fileW io.Writer) io.Writer {
+	if fileW != nil {
+		return io.MultiWriter(os.Stderr, fileW)
+	}
+	return os.Stderr
+}
+
+// resolveColumns returns the effective column list: CLI flag → config file → nil.
+func resolveColumns(cliColumns string, cfgColumns []string) []string {
+	if cols := parseColumns(cliColumns); len(cols) > 0 {
+		return cols
+	}
+	return cfgColumns
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 // parseSeverities converts "4,3,2" → []int{4,3,2}, deduplicating and
 // validating that each value is in the range [0,4].
@@ -331,7 +521,7 @@ func filterSCs(cfg *config.Config, names string) (*config.Config, error) {
 		}
 	}
 	if len(kept) == 0 {
-		return nil, fmt.Errorf("--sc %q matched no configured security centers", names)
+		return nil, fmt.Errorf("%q matched no configured security centers", names)
 	}
 	out := *cfg
 	out.SecurityCenters = kept
@@ -374,15 +564,13 @@ func buildLogger(cliFlag string, effectiveLevel slog.Level, stderr io.Writer, fi
 	if fileW == nil {
 		return slog.New(textH)
 	}
-	// JSON to file gives machine-readable, grep-friendly log records.
 	jsonH := slog.NewJSONHandler(fileW, opts)
 	return slog.New(&multiHandler{handlers: []slog.Handler{textH, jsonH}})
 }
 
 // ── multiHandler ─────────────────────────────────────────────────────────────
 
-// multiHandler fans out every slog record to multiple handlers simultaneously,
-// enabling concurrent console (text) and file (JSON) logging with a single logger.
+// multiHandler fans out every slog record to multiple handlers simultaneously.
 type multiHandler struct {
 	handlers []slog.Handler
 }
