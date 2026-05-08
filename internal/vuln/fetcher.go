@@ -4,6 +4,7 @@ package vuln
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -27,13 +28,16 @@ type Options struct {
 	Severities []int
 	// PluginText is an optional substring filter applied against plugin output.
 	PluginText string
-	// ExtraFilters are additional API filters supplied by the caller.
+	// ExtraFilters are additional API filters supplied via the CLI --filter flag.
 	ExtraFilters []client.Filter
-	// FilterMode is either "append" (add ExtraFilters to defaults) or
-	// "override" (replace default pluginText filter with ExtraFilters).
+	// FilterMode is either "append" (add to config + pluginText defaults) or
+	// "override" (use only severity + ExtraFilters; skip config and pluginText).
 	FilterMode string
 	// Columns lists the SC field names to include in results.
 	Columns []string
+	// DumpWriter is where request JSON bodies are written before each HTTP call.
+	// Typically io.MultiWriter(os.Stderr, logFile). Nil disables dumping.
+	DumpWriter io.Writer
 }
 
 // Result carries the output (or error) for one SC × severity combination.
@@ -47,10 +51,13 @@ type Result struct {
 // FetchAll launches one goroutine per (SecurityCenter × severity) pair so that
 // all combinations run concurrently, maximising throughput across multiple SC
 // instances and severity levels.
+//
+// Config filters are merged per SC: global default_filters first, then the
+// per-SC filters block, then CLI filters (behaviour depends on FilterMode).
 func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 	columns := toColumns(opts.Columns)
 
-	// Pre-allocate result slice so goroutines can write without a mutex.
+	// Pre-allocate result slice indexed by goroutine slot — no mutex needed.
 	total := len(cfg.SecurityCenters) * len(opts.Severities)
 	results := make([]Result, total)
 
@@ -58,16 +65,19 @@ func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 	idx := 0
 
 	for _, sc := range cfg.SecurityCenters {
-		c := client.New(sc.URL, sc.AccessKey, sc.SecretKey, sc.SkipTLS, cfg.PageSize, log)
+		c := client.New(sc.URL, sc.AccessKey, sc.SecretKey, sc.SkipTLS, cfg.PageSize, log, opts.DumpWriter)
 		scLog := log.With("sc", sc.Name, "url", sc.URL)
+
+		// Merge global default_filters + this SC's filters into one ordered slice.
+		scConfigFilters := configToClientFilters(cfg.DefaultFilters)
+		scConfigFilters = append(scConfigFilters, configToClientFilters(sc.Filters)...)
 
 		for _, sev := range opts.Severities {
 			wg.Add(1)
-			// Capture loop variables for the goroutine.
-			go func(slot int, scName string, cl *client.Client, l *slog.Logger, severity int) {
+			go func(slot int, scName string, cl *client.Client, l *slog.Logger, severity int, cfgFilters []client.Filter) {
 				defer wg.Done()
 
-				filters := buildFilters(opts, severity)
+				filters := buildFilters(opts, severity, cfgFilters)
 
 				l.Info("fetching vulnerabilities",
 					"severity", fmt.Sprintf("%d (%s)", severity, SeverityName[severity]),
@@ -95,7 +105,7 @@ func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 					Records:  records,
 					Err:      err,
 				}
-			}(idx, sc.Name, c, scLog, sev)
+			}(idx, sc.Name, c, scLog, sev, scConfigFilters)
 
 			idx++
 		}
@@ -105,26 +115,34 @@ func FetchAll(cfg *config.Config, opts *Options, log *slog.Logger) []Result {
 	return results
 }
 
-// buildFilters constructs the filter slice for one severity level, respecting
-// the caller's FilterMode setting.
-func buildFilters(opts *Options, severity int) []client.Filter {
+// buildFilters assembles the final filter list for one severity level.
+//
+// append mode (default):
+//
+//	severity → configFilters (from config file) → pluginText (CLI) → ExtraFilters (CLI)
+//
+// override mode:
+//
+//	severity → ExtraFilters (CLI only; config and pluginText are skipped)
+func buildFilters(opts *Options, severity int, configFilters []client.Filter) []client.Filter {
 	sevFilter := client.Filter{FilterName: "severity", Operator: "=", Value: strconv.Itoa(severity)}
 
-	if opts.FilterMode == "override" && len(opts.ExtraFilters) > 0 {
-		// Severity is always included; ExtraFilters replace everything else.
+	if opts.FilterMode == "override" {
+		// Severity is always kept; everything else is replaced by CLI --filter values.
 		return append([]client.Filter{sevFilter}, opts.ExtraFilters...)
 	}
 
-	// Default (append): severity + optional pluginText + any extra filters.
-	base := []client.Filter{sevFilter}
+	// Append mode: start with severity, layer config filters, then CLI additions.
+	out := []client.Filter{sevFilter}
+	out = append(out, configFilters...)
 	if opts.PluginText != "" {
-		base = append(base, client.Filter{
+		out = append(out, client.Filter{
 			FilterName: "pluginText",
 			Operator:   "=",
 			Value:      opts.PluginText,
 		})
 	}
-	return append(base, opts.ExtraFilters...)
+	return append(out, opts.ExtraFilters...)
 }
 
 // Flatten merges all Results into a flat slice of maps, tagging each row with
@@ -146,12 +164,25 @@ func Flatten(results []Result) ([]map[string]any, []error) {
 				errs = append(errs, fmt.Errorf("unmarshalling record: %w", err))
 				continue
 			}
-			// Inject source metadata so downstream consumers can correlate results.
+			// Tag each row so downstream consumers know which SC produced it.
 			row["_sc"] = r.SCName
 			rows = append(rows, row)
 		}
 	}
 	return rows, errs
+}
+
+// configToClientFilters converts config.FilterConfig slice to client.Filter slice.
+func configToClientFilters(cfgFilters []config.FilterConfig) []client.Filter {
+	out := make([]client.Filter, len(cfgFilters))
+	for i, f := range cfgFilters {
+		op := f.Operator
+		if op == "" {
+			op = "="
+		}
+		out[i] = client.Filter{FilterName: f.Name, Operator: op, Value: f.Value}
+	}
+	return out
 }
 
 // toColumns converts a slice of field name strings into Column structs.

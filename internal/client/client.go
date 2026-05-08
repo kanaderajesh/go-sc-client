@@ -65,10 +65,15 @@ type Client struct {
 	pageSize  int
 	httpC     *http.Client
 	log       *slog.Logger
+	// dumpW receives a pretty-printed copy of every request body before it is
+	// sent. Pass nil to disable. Typically wired to both stderr and a log file
+	// via io.MultiWriter so the JSON is visible on the console and persisted.
+	dumpW io.Writer
 }
 
 // New creates a Client for one Security Center instance.
-func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *slog.Logger) *Client {
+// dumpW is where request JSON bodies are written before each call; nil disables dumping.
+func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *slog.Logger, dumpW io.Writer) *Client {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLS}, //nolint:gosec
 		MaxIdleConns:    10,
@@ -83,7 +88,8 @@ func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *
 			Timeout:   120 * time.Second,
 			Transport: transport,
 		},
-		log: log,
+		log:   log,
+		dumpW: dumpW,
 	}
 }
 
@@ -130,8 +136,20 @@ func (c *Client) FetchAll(filters []Filter, columns []Column) ([]json.RawMessage
 	return all, nil
 }
 
-// post marshals req, sends it to /rest/analysis, and returns the parsed response.
+// post marshals req, dumps it, sends it to /rest/analysis, and returns the parsed response.
 func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
+	// Pretty-print and dump request JSON to console + log file before sending.
+	if c.dumpW != nil {
+		pretty, _ := json.MarshalIndent(body, "", "  ")
+		fmt.Fprintf(c.dumpW,
+			"\n=== Request: POST %s/rest/analysis (offset %d) ===\n%s\n%s\n\n",
+			c.baseURL,
+			body.StartOffset,
+			pretty,
+			strings.Repeat("=", 60),
+		)
+	}
+
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshalling request: %w", err)
