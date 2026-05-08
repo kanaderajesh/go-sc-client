@@ -23,23 +23,25 @@ type Filter struct {
 }
 
 // analysisRequest is the JSON body for POST /rest/analysis.
+// Per the Tenable SC REST API spec, startOffset/endOffset belong inside
+// the query object and columns is an array of field-name strings.
 type analysisRequest struct {
-	Type        string `json:"type"`
-	SourceType  string `json:"sourceType"`
-	Query       query  `json:"query"`
-	SortField   string `json:"sortField,omitempty"`
-	SortDir     string `json:"sortDir,omitempty"`
-	// Columns is a comma-separated list of field names, e.g. "ip,pluginID,severity".
-	// An empty string requests all available fields.
-	Columns     string `json:"columns,omitempty"`
-	StartOffset string `json:"startOffset"`
-	EndOffset   string `json:"endOffset"`
+	Type       string   `json:"type"`
+	SourceType string   `json:"sourceType"`
+	Query      query    `json:"query"`
+	SortField  string   `json:"sortField,omitempty"`
+	SortDir    string   `json:"sortDir,omitempty"`
+	// Columns is an array of SC field names to include in the response,
+	// e.g. ["ip","pluginID","severity"]. An empty slice returns all fields.
+	Columns []string `json:"columns,omitempty"`
 }
 
 type query struct {
-	Type    string   `json:"type"`
-	Tool    string   `json:"tool"`
-	Filters []Filter `json:"filters"`
+	Type        string   `json:"type"`
+	Tool        string   `json:"tool"`
+	Filters     []Filter `json:"filters"`
+	StartOffset string   `json:"startOffset"`
+	EndOffset   string   `json:"endOffset"`
 }
 
 // analysisResponse mirrors the SC API response envelope.
@@ -93,9 +95,9 @@ func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, log *
 
 // FetchAll pages through POST /rest/analysis and returns every matching record
 // as a raw JSON object. It handles pagination automatically.
-// columns is a comma-separated list of SC field names (e.g. "ip,pluginID,severity");
-// pass an empty string to request all available fields.
-func (c *Client) FetchAll(filters []Filter, columns string) ([]json.RawMessage, error) {
+// columns is the list of SC field names to return (e.g. ["ip","pluginID","severity"]);
+// pass nil or an empty slice to request all available fields.
+func (c *Client) FetchAll(filters []Filter, columns []string) ([]json.RawMessage, error) {
 	var all []json.RawMessage
 
 	for start := 0; ; start += c.pageSize {
@@ -103,15 +105,15 @@ func (c *Client) FetchAll(filters []Filter, columns string) ([]json.RawMessage, 
 			Type:       "vuln",
 			SourceType: "cumulative",
 			Query: query{
-				Type:    "vuln",
-				Tool:    "vulndetails",
-				Filters: filters,
+				Type:        "vuln",
+				Tool:        "vulndetails",
+				Filters:     filters,
+				StartOffset: strconv.Itoa(start),
+				EndOffset:   strconv.Itoa(start + c.pageSize),
 			},
-			SortField:   "severity",
-			SortDir:     "desc",
-			Columns:     columns,
-			StartOffset: strconv.Itoa(start),
-			EndOffset:   strconv.Itoa(start + c.pageSize),
+			SortField: "severity",
+			SortDir:   "desc",
+			Columns:   columns,
 		}
 
 		resp, err := c.post(req)
@@ -144,7 +146,7 @@ func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 		fmt.Fprintf(c.dumpW,
 			"\n=== Request: POST %s/rest/analysis (offset %s) ===\n%s\n%s\n\n",
 			c.baseURL,
-			body.StartOffset,
+			body.Query.StartOffset,
 			pretty,
 			strings.Repeat("=", 60),
 		)
@@ -164,7 +166,7 @@ func (c *Client) post(body analysisRequest) (*analysisResponse, error) {
 	// Tenable SC API key authentication header (SC 5.13+).
 	req.Header.Set("X-ApiKey", fmt.Sprintf("accessKey=%s; secretKey=%s", c.accessKey, c.secretKey))
 
-	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.StartOffset, "endOffset", body.EndOffset)
+	c.log.Debug("POST /rest/analysis", "url", c.baseURL, "startOffset", body.Query.StartOffset, "endOffset", body.Query.EndOffset)
 
 	httpResp, err := c.httpC.Do(req)
 	if err != nil {
