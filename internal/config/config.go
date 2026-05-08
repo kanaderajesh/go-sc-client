@@ -47,6 +47,12 @@ type Config struct {
 	// Timeout is the HTTP request timeout in seconds (default 300).
 	// Increase this when querying large repositories or slow SC instances.
 	Timeout int `yaml:"timeout"`
+	// SearchKeywords is the list of substrings searched case-insensitively
+	// against the pluginText field when running in full-search mode (--search-output).
+	SearchKeywords []string `yaml:"search_keywords"`
+	// SearchOutput is the default CSV output path for full-search mode.
+	// Can be overridden at runtime with --search-output.
+	SearchOutput string `yaml:"search_output"`
 }
 
 // Load reads and validates the YAML config file at path.

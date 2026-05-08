@@ -104,6 +104,58 @@ func New(baseURL, accessKey, secretKey string, skipTLS bool, pageSize int, timeo
 	}
 }
 
+// PageFn is called by Stream after each page is fetched.
+// page is 1-based; seen is cumulative records fetched; total is the
+// API-reported total (0 when the response value is unparseable).
+// Return a non-nil error to abort pagination early.
+type PageFn func(records []json.RawMessage, page, seen, total int) error
+
+// Stream pages through POST /rest/analysis and calls fn for each page.
+// It stops when fn returns an error or the final page is reached.
+func (c *Client) Stream(filters []Filter, columns []string, fn PageFn) error {
+	seen := 0
+	for page := 1; ; page++ {
+		start := (page - 1) * c.pageSize
+		req := analysisRequest{
+			Type:       "vuln",
+			SourceType: "cumulative",
+			Query: query{
+				Type:        "vuln",
+				Tool:        "vulndetails",
+				Filters:     filters,
+				StartOffset: strconv.Itoa(start),
+				EndOffset:   strconv.Itoa(start + c.pageSize),
+			},
+			SortField: "severity",
+			SortDir:   "desc",
+			Columns:   columns,
+		}
+
+		resp, err := c.post(req)
+		if err != nil {
+			return err
+		}
+
+		seen += len(resp.Response.Results)
+		total, _ := strconv.Atoi(resp.Response.TotalRecords)
+
+		c.log.Debug("stream page fetched",
+			"page", page,
+			"seen", seen,
+			"total", total,
+		)
+
+		if err := fn(resp.Response.Results, page, seen, total); err != nil {
+			return err
+		}
+
+		if resp.Response.ReturnedRecords < c.pageSize {
+			break
+		}
+	}
+	return nil
+}
+
 // FetchAll pages through POST /rest/analysis and returns every matching record
 // as a raw JSON object. It handles pagination automatically.
 // columns is the list of SC field names to return (e.g. ["ip","pluginID","severity"]);
