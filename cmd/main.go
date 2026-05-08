@@ -137,7 +137,14 @@ Example config (config.yaml):
 				return fmt.Errorf("--filter: %w", err)
 			}
 
+			// Column resolution (highest to lowest priority):
+			//   1. --columns CLI flag
+			//   2. default_columns from config file
+			//   3. built-in defaultColumns (hard-coded fallback)
 			cols := parseColumns(columns)
+			if len(cols) == 0 {
+				cols = cfg.DefaultColumns
+			}
 
 			opts := &vuln.Options{
 				Severities:   sevList,
@@ -154,6 +161,7 @@ Example config (config.yaml):
 				"pluginText", pluginText,
 				"filterMode", filterMode,
 				"format", format,
+				"columns", strings.Join(cols, ","),
 				"logFile", effectiveLogFile,
 			)
 
@@ -166,7 +174,8 @@ Example config (config.yaml):
 
 			log.Info("done", "total_records", len(rows))
 
-			// Fall back to default columns when none were explicitly requested.
+			// Use resolved cols for display; fall back to built-in defaults only
+			// when neither CLI nor config supplied any columns.
 			displayCols := cols
 			if len(displayCols) == 0 {
 				displayCols = defaultColumns
